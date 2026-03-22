@@ -7,6 +7,11 @@
  *   - memory_search / memory_get  (matching memory-tool.ts)
  *   - web_search / web_fetch      (matching web-search.ts / web-fetch.ts)
  *
+ * When toolMode=named, replaces exec+read with named CLI tools:
+ *   - himalaya, gcalcli, notion_cli, slack_cli, memo
+ *   Each routes through /tools/exec with the command prefixed.
+ *   Agent cannot run arbitrary shell commands.
+ *
  * Each tool proxies to a mock server that returns deterministic fixture data.
  * The tool schemas the LLM sees are identical to production OpenClaw.
  */
@@ -20,6 +25,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 interface PluginConfig {
   mockServerUrl?: string;
   scenario?: string;
+  toolMode?: "legacy" | "named";
 }
 
 interface ToolDefinition {
@@ -291,6 +297,82 @@ const TOOLS: ToolDefinition[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Named CLI Tools — replace exec+read with scoped tools (toolMode=named)
+// ---------------------------------------------------------------------------
+
+interface NamedToolDef {
+  name: string;
+  cliName: string;
+  description: string;
+}
+
+const NAMED_TOOLS: NamedToolDef[] = [
+  {
+    name: "himalaya",
+    cliName: "himalaya",
+    description:
+      "Email client. Run with args='--help' for full usage. " +
+      "Examples: 'envelope list', 'message read msg_101', " +
+      "'message send --to a@b.com --subject Hi --body Hello'.",
+  },
+  {
+    name: "gcalcli",
+    cliName: "gcalcli",
+    description:
+      "Calendar client. Run with args='--help' for full usage. " +
+      "Examples: 'agenda', 'search standup', " +
+      "'add --title Meeting --when 2pm --duration 30m'.",
+  },
+  {
+    name: "notion_cli",
+    cliName: "notion-cli",
+    description:
+      "Task board client. Run with args='--help' for full usage. " +
+      "Examples: 'tasks', 'tasks --status in_progress', " +
+      "'task TC-950', 'create --title \"New task\"'.",
+  },
+  {
+    name: "slack_cli",
+    cliName: "slack-cli",
+    description:
+      "Slack messaging client. Run with args='--help' for full usage. " +
+      "Examples: 'channels', 'read platform-engineering', " +
+      "'send --to general --message Hello'.",
+  },
+  {
+    name: "memo",
+    cliName: "memo",
+    description:
+      "Memory and context search. Run with args='--help' for full usage. " +
+      "Examples: 'search sprint goals', 'read memory/clients.md'.",
+  },
+];
+
+const NAMED_TOOL_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    args: {
+      type: "string" as const,
+      description: "Command-line arguments (everything after the tool name).",
+    },
+  },
+  required: ["args"] as string[],
+};
+
+/**
+ * Build the tool list based on toolMode config.
+ * - "legacy" (default): exec, read, slack, memory_*, web_*
+ * - "named": himalaya, gcalcli, notion_cli, slack_cli, memo, slack, memory_*, web_*
+ */
+function getToolsForMode(mode: string): ToolDefinition[] {
+  if (mode === "named") {
+    // Exclude exec and read; named tools replace them
+    return TOOLS.filter((t) => t.name !== "exec" && t.name !== "read");
+  }
+  return TOOLS;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin helpers
 // ---------------------------------------------------------------------------
 
@@ -396,15 +478,27 @@ const clawBenchPlugin = {
         default: "inbox_triage",
         description: "Current scenario name for fixtures",
       },
+      toolMode: {
+        type: "string" as const,
+        default: "legacy",
+        description:
+          'Tool registration mode. "legacy" = exec+read (default). ' +
+          '"named" = himalaya/gcalcli/notion_cli/slack_cli/memo (no general shell).',
+      },
     },
   },
 
   register(api: OpenClawPluginApi) {
-    api.logger.info("ClawBench Tools plugin loading (corrected schema v0.3.0)...");
-
     const pluginConfig = getPluginConfig(api);
+    const toolMode = pluginConfig.toolMode ?? "legacy";
 
-    for (const tool of TOOLS) {
+    api.logger.info(
+      `ClawBench Tools plugin loading (v0.4.0, mode=${toolMode})...`,
+    );
+
+    // Register standard tools (filtered by mode)
+    const tools = getToolsForMode(toolMode);
+    for (const tool of tools) {
       const toolName = tool.name;
 
       api.registerTool(
@@ -440,9 +534,49 @@ const clawBenchPlugin = {
       );
     }
 
+    // Register named CLI tools when in named mode
+    if (toolMode === "named") {
+      for (const namedTool of NAMED_TOOLS) {
+        const { name, cliName, description } = namedTool;
+
+        api.registerTool(
+          {
+            name,
+            description,
+            parameters: NAMED_TOOL_SCHEMA,
+            async execute(...args: unknown[]) {
+              const params = extractParams(args, api.logger);
+              const cliArgs = (params.args as string) ?? "--help";
+
+              // Route through exec handler with constructed command
+              const result = await callMockServer(
+                pluginConfig,
+                "/tools/exec",
+                { command: `${cliName} ${cliArgs}` },
+                api.logger,
+              );
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: JSON.stringify(result, null, 2),
+                  },
+                ],
+              };
+            },
+          },
+          { names: [name] },
+        );
+      }
+    }
+
+    const allNames = [
+      ...tools.map((t) => t.name),
+      ...(toolMode === "named" ? NAMED_TOOLS.map((t) => t.name) : []),
+    ];
     api.logger.info(
-      `ClawBench Tools plugin loaded: ${TOOLS.length} tools registered ` +
-        `(${TOOLS.map((t) => t.name).join(", ")})`,
+      `ClawBench Tools plugin loaded: ${allNames.length} tools registered ` +
+        `(${allNames.join(", ")})`,
     );
   },
 };
